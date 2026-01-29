@@ -68,6 +68,7 @@ interface PendingApproval {
 }
 
 export function Dashboard() {
+  console.log("[v0] Dashboard component mounting")
   const [tasks, setTasks] = useState<Task[]>([])
   const [agents, setAgents] = useState<Agent[]>([])
   const [selectedTaskId, setSelectedTaskId] = useState<number | null>(null)

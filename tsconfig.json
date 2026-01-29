@@ -23,5 +23,5 @@
     }
   },
   "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],
-  "exclude": ["node_modules", "app/src"]
+  "exclude": ["node_modules", "app/src", "multi-agent-orchestrator", "vite.config.ts"]
 }

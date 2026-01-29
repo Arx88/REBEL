@@ -163,12 +163,12 @@ function AgentSection({
         </div>
       </div>
       
-      <div className="grid grid-cols-10 sm:grid-cols-15 lg:grid-cols-20 gap-1.5">
+      <div className="grid grid-cols-5 sm:grid-cols-10 lg:grid-cols-10 xl:grid-cols-10 gap-1.5">
         <TooltipProvider delayDuration={100}>
           {agents.map(agent => (
             <AgentCell key={agent.id} agent={agent} />
           ))}
-          {agents.length < 20 && Array.from({ length: Math.max(0, 20 - agents.length) }).map((_, i) => (
+          {agents.length < 10 && Array.from({ length: Math.max(0, 10 - agents.length) }).map((_, i) => (
             <div 
               key={`empty-${i}`} 
               className="aspect-square rounded-md border border-dashed border-border/30 bg-muted/10" 

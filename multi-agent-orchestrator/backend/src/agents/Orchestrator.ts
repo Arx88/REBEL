@@ -1,6 +1,7 @@
 import { BaseCLIAgent } from './BaseCLIAgent';
 import { ORCHESTRATOR_PROMPT } from '../prompts';
 import { Plan, Phase, SubTask } from '../../../shared/types';
+import { normalizeSubtask } from '../core/PlanQuality';
 import { ParallelExecutor, VerificationHooks } from '../core/ParallelExecutor';
 import { CriticAgent, CriticResult, VerificationCriteria, CriticFeedback } from './CriticAgent';
 
@@ -61,6 +62,7 @@ export class Orchestrator extends BaseCLIAgent {
   private parallelExecutor: ParallelExecutor;
   private criticAgent: CriticAgent;
   private maxRetryIterations: number = 3;
+  private maxReplanAttempts: number = 1;
 
   constructor(
     agentPool: any, 
@@ -159,6 +161,8 @@ export class Orchestrator extends BaseCLIAgent {
       totalSubtasks
     });
 
+    const verificationHooks = this.createVerificationHooks(taskId);
+
     // Generate Delegation Contracts for all subtasks
     const contracts = await this.generateDelegationContracts(taskId, phase, phaseIndex);
 
@@ -185,18 +189,32 @@ export class Orchestrator extends BaseCLIAgent {
       const batchResults = await this.parallelExecutor.executeBatch(
         `phase_${phaseIndex}_batch`, 
         parallelTasks,
-        this.createVerificationHooks(taskId),
+        verificationHooks,
         taskId
       );
 
       // Process results with critic verification
       for (const [subtaskId, result] of batchResults) {
         const contract = contracts.find(c => c.subtaskId === subtaskId)!;
-        const executionResult = await this.verifyAndRetry(
+        let executionResult = await this.verifyAndRetry(
           taskId, 
           result, 
           contract
         );
+
+        if (!executionResult.success) {
+          const replannedResult = await this.attemptReplanSubtask(
+            taskId,
+            phase,
+            phaseIndex,
+            contract,
+            executionResult,
+            verificationHooks
+          );
+          if (replannedResult) {
+            executionResult = replannedResult;
+          }
+        }
 
         subtaskResults.set(subtaskId, executionResult);
         completedSubtasks += 1;
@@ -264,41 +282,183 @@ export class Orchestrator extends BaseCLIAgent {
     const contracts: DelegationContract[] = [];
 
     for (const subtask of phase.subtasks) {
-      // Build CMN context using semantic search
-      const query = `${subtask.description} ${subtask.deliverable} ${phase.name}`;
-      let contextCMN: string;
-
-      try {
-        contextCMN = await this.memoryManager.buildCMN(taskId, {
-          query,
-          maxTokens: this.calculateMaxTokens(subtask),
-          includeStructure: subtask.assigned_agent_type === 'implementer',
-          priorityBoost: true
-        });
-      } catch {
-        // Fallback to basic context
-        contextCMN = this.getRelevantContext(taskId, subtask.required_context, 2000);
-      }
-
-      // Add files to read if specified
-      if (subtask.files_to_read && subtask.files_to_read.length > 0) {
-        contextCMN += `\n\n## Files to analyze\n${subtask.files_to_read.join('\n')}`;
-      }
-
-      contracts.push({
-        subtaskId: subtask.id,
-        objective: subtask.description,
-        contextCMN,
-        deliverable: subtask.deliverable,
-        verificationCriteria: subtask.validation_method,
-        maxTokens: this.calculateMaxTokens(subtask),
-        assignedModel: this.selectModelForSubtask(subtask),
-        dependencies: subtask.dependencies,
-        files_to_read: subtask.files_to_read
-      });
+      contracts.push(await this.createDelegationContract(taskId, phase, subtask));
     }
 
     return contracts;
+  }
+
+  private async createDelegationContract(
+    taskId: number,
+    phase: Phase,
+    subtask: SubTask
+  ): Promise<DelegationContract> {
+    // Build CMN context using semantic search
+    const query = `${subtask.description} ${subtask.deliverable} ${phase.name}`;
+    let contextCMN: string;
+
+    try {
+      contextCMN = await this.memoryManager.buildCMN(taskId, {
+        query,
+        maxTokens: this.calculateMaxTokens(subtask),
+        includeStructure: subtask.assigned_agent_type === 'implementer',
+        priorityBoost: true
+      });
+    } catch {
+      // Fallback to basic context
+      contextCMN = this.getRelevantContext(taskId, subtask.required_context, 2000);
+    }
+
+    // Add files to read if specified
+    if (subtask.files_to_read && subtask.files_to_read.length > 0) {
+      contextCMN += `\n\n## Files to analyze\n${subtask.files_to_read.join('\n')}`;
+    }
+
+    return {
+      subtaskId: subtask.id,
+      objective: subtask.description,
+      contextCMN,
+      deliverable: subtask.deliverable,
+      verificationCriteria: subtask.validation_method,
+      maxTokens: this.calculateMaxTokens(subtask),
+      assignedModel: this.selectModelForSubtask(subtask),
+      dependencies: subtask.dependencies,
+      files_to_read: subtask.files_to_read
+    };
+  }
+
+  private async attemptReplanSubtask(
+    taskId: number,
+    phase: Phase,
+    phaseIndex: number,
+    contract: DelegationContract,
+    executionResult: ExecutionResult,
+    verificationHooks: VerificationHooks
+  ): Promise<ExecutionResult | null> {
+    if (this.maxReplanAttempts < 1 || executionResult.iterations < this.maxRetryIterations) {
+      return null;
+    }
+
+    const replanKey = `replan_attempt_${contract.subtaskId}`;
+    const previousAttempts = this.memoryManager.get(taskId, replanKey) || 0;
+    if (previousAttempts >= this.maxReplanAttempts) {
+      return null;
+    }
+    this.memoryManager.set(taskId, replanKey, previousAttempts + 1, { priority: 'low' });
+
+    const replannedSubtask = await this.replanFailedSubtask(taskId, phase, contract, executionResult);
+    if (!replannedSubtask) {
+      return null;
+    }
+
+    const subtaskIndex = phase.subtasks.findIndex(subtask => subtask.id === contract.subtaskId);
+    if (subtaskIndex >= 0) {
+      phase.subtasks[subtaskIndex] = replannedSubtask;
+    }
+
+    const replannedContract = await this.createDelegationContract(taskId, phase, replannedSubtask);
+    const replannedBatch = await this.parallelExecutor.executeBatch(
+      `phase_${phaseIndex}_replan_${contract.subtaskId}`,
+      [
+        {
+          id: replannedContract.subtaskId,
+          model: replannedContract.assignedModel,
+          description: replannedContract.objective,
+          assignedAgent: replannedContract.assignedModel,
+          prompt: this.buildExecutionPrompt(replannedContract),
+          context: replannedContract.contextCMN,
+          verificationCriteria: {
+            objective: replannedContract.objective,
+            deliverable: replannedContract.deliverable,
+            verificationCriteria: replannedContract.verificationCriteria,
+            subtaskId: replannedContract.subtaskId
+          } as VerificationCriteria
+        }
+      ],
+      verificationHooks,
+      taskId
+    );
+
+    const replannedResult = replannedBatch.get(replannedContract.subtaskId);
+    if (!replannedResult) {
+      return null;
+    }
+
+    return this.verifyAndRetry(
+      taskId,
+      replannedResult,
+      replannedContract
+    );
+  }
+
+  private async replanFailedSubtask(
+    taskId: number,
+    phase: Phase,
+    contract: DelegationContract,
+    executionResult: ExecutionResult
+  ): Promise<SubTask | null> {
+    const prompt = this.buildSubtaskReplanPrompt(phase, contract, executionResult);
+    const response = await this.agentPool.executeWithAgent(
+      'gemini',
+      prompt,
+      contract.contextCMN,
+      undefined,
+      taskId
+    );
+
+    if (!response.success) {
+      return null;
+    }
+
+    const parsed = this.extractJSON<Partial<SubTask>>(response.data);
+    if (!parsed) {
+      return null;
+    }
+
+    const fixes: string[] = [];
+    const normalized = normalizeSubtask(parsed, contract.subtaskId, fixes);
+    const validIds = new Set(phase.subtasks.map(subtask => subtask.id));
+    normalized.dependencies = normalized.dependencies.filter(dep => dep !== normalized.id && validIds.has(dep));
+
+    return normalized;
+  }
+
+  private buildSubtaskReplanPrompt(
+    phase: Phase,
+    contract: DelegationContract,
+    executionResult: ExecutionResult
+  ): string {
+    return `
+Eres un planificador que debe corregir UNA subtarea fallida sin replanificar todo el plan.
+
+## CONTEXTO
+Fase: ${phase.name}
+
+Subtarea actual:
+- ID: ${contract.subtaskId}
+- Objetivo: ${contract.objective}
+- Deliverable: ${contract.deliverable}
+- Criterios de verificación: ${contract.verificationCriteria}
+- Dependencias: ${contract.dependencies.join(', ') || 'Ninguna'}
+
+Resultado fallido:
+- Exitoso: ${executionResult.success ? 'Sí' : 'No'}
+- Iteraciones: ${executionResult.iterations}
+- Salida/Error: ${executionResult.deliverable.substring(0, 500)}
+
+## INSTRUCCIONES
+Proporciona una versión mejorada de ESTA subtarea (solo este nodo) con:
+- description (más clara y accionable)
+- deliverable (completo y verificable)
+- validation_method (prueba ejecutable)
+- assigned_agent_type (researcher | implementer | analyzer)
+- estimated_complexity (1-10)
+- dependencies (solo IDs existentes si aplica)
+- files_to_read (si aplica)
+- required_context (si aplica)
+
+Responde SOLO con JSON.
+    `.trim();
   }
 
   /**

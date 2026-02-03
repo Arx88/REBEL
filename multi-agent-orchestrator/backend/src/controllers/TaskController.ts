@@ -9,6 +9,7 @@ import { PlanRefiner } from '../agents/PlanRefiner';
 import { Orchestrator } from '../agents/Orchestrator';
 import { Synthesizer } from '../agents/Synthesizer';
 import { socketManager } from '../websocket/socketManager';
+import { scorePlanQuality } from '../core/PlanQuality';
 import { 
   createTask, 
   updateTaskStatus, 
@@ -54,6 +55,7 @@ export class TaskController {
   // Refinement settings
   private enablePlanRefinement: boolean = true;
   private maxRefinementIterations: number = 3;
+  private planQualityThreshold: number = 7;
 
   constructor(db: Database.Database, agentPool: AgentPool, memoryManager: MemoryManager) {
     this.db = db;
@@ -189,8 +191,16 @@ export class TaskController {
         throw new Error('No se pudo generar un plan válido');
       }
 
+      const planQuality = scorePlanQuality(plan);
+      const needsRefinement = planQuality.overall < this.planQualityThreshold;
+      this.recordTimeline(taskId, 'plan_scored', `Plan scored: ${planQuality.overall}`, {
+        score: planQuality,
+        threshold: this.planQualityThreshold,
+        needsRefinement
+      });
+
       // FASE 1.5: PLAN REFINEMENT (Multi-agent iterative improvement)
-      if (this.enablePlanRefinement) {
+      if (this.enablePlanRefinement && needsRefinement) {
         const refinedPlan = await this.runPlanRefinementPhase(taskId, plan, userInput, context);
         if (refinedPlan) {
           plan = refinedPlan;
@@ -374,13 +384,13 @@ export class TaskController {
       validationResult.confidence,
       JSON.stringify({
         issues: validationResult.issues,
-        suggestions: validationResult.suggestions
+        suggestions: validationResult.suggestions,
+        qualityScore: validationResult.qualityScore
       }),
       taskId
     );
 
     this.recordTimeline(
-      this.db, 
       taskId, 
       validationResult.approved ? 'plan_validated' : 'plan_needs_review',
       validationResult.approved 

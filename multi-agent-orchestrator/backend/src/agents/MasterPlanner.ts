@@ -1,6 +1,7 @@
 import { BaseCLIAgent } from './BaseCLIAgent';
 import { MASTER_PLANNER_PROMPT } from '../prompts';
 import { Plan } from '../../../shared/types';
+import { normalizePlan, validatePlanStrict } from '../core/PlanQuality';
 
 export interface PlanningResult {
   success: boolean;
@@ -28,23 +29,19 @@ export class MasterPlanner extends BaseCLIAgent {
 
     const parsedPlan = this.extractJSON<Plan>(result.data);
 
-    if (parsedPlan && this.validatePlanStructure(parsedPlan)) {
-      this.saveToMemory(taskId, 'final_plan', parsedPlan);
-      return { success: true, plan: parsedPlan, rawResponse: result.data, iterations: 1, executionTime: Date.now() - startTime };
+    if (parsedPlan) {
+      const { plan: normalizedPlan, fixes } = normalizePlan(parsedPlan, userInput);
+      const validation = validatePlanStrict(normalizedPlan);
+
+      if (validation.valid) {
+        this.saveToMemory(taskId, 'final_plan', normalizedPlan);
+        if (fixes.length > 0) {
+          this.saveToMemory(taskId, 'plan_normalization_fixes', fixes);
+        }
+        return { success: true, plan: normalizedPlan, rawResponse: result.data, iterations: 1, executionTime: Date.now() - startTime };
+      }
     }
 
     return { success: false, rawResponse: result.data, iterations: 1, executionTime: Date.now() - startTime };
-  }
-
-  private validatePlanStructure(plan: Plan): boolean {
-    if (!plan.objective || !Array.isArray(plan.phases) || plan.phases.length < 3) return false;
-
-    for (const phase of plan.phases) {
-      if (!phase.name || !Array.isArray(phase.subtasks)) return false;
-      for (const subtask of phase.subtasks) {
-        if (!subtask.id || !subtask.description) return false;
-      }
-    }
-    return true;
   }
 }

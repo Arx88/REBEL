@@ -75,7 +75,9 @@ export abstract class BaseCLIAgent extends EventEmitter {
           const result = await this.agentPool.executeWithAgent(
             this.config.model, 
             prompt, 
-            context
+            context,
+            undefined,
+            taskId
           );
 
           if (result.success) {

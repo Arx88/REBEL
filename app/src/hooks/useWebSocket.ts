@@ -21,6 +21,8 @@ interface UseWebSocketReturn {
   sendMessage: (message: WebSocketMessage) => void;
   subscribe: (taskId: number) => void;
   unsubscribe: (taskId: number) => void;
+  subscribeGlobal: () => void;
+  unsubscribeGlobal: () => void;
 }
 
 export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
@@ -95,6 +97,14 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
     sendMessage({ type: 'unsubscribe_task', payload: { taskId } });
   }, [sendMessage]);
 
+  const subscribeGlobal = useCallback(() => {
+    sendMessage({ type: 'subscribe_global', payload: {} });
+  }, [sendMessage]);
+
+  const unsubscribeGlobal = useCallback(() => {
+    sendMessage({ type: 'unsubscribe_global', payload: {} });
+  }, [sendMessage]);
+
   useEffect(() => {
     connect();
 
@@ -112,5 +122,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
     sendMessage,
     subscribe,
     unsubscribe,
+    subscribeGlobal,
+    unsubscribeGlobal,
   };
 }

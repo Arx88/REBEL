@@ -13,6 +13,8 @@ interface Agent {
   totalExecutions: number;
   failedExecutions: number;
   successRate: number;
+  currentModel?: string;
+  usingFallback?: boolean;
 }
 
 interface AgentGridProps {
@@ -287,6 +289,30 @@ function AgentCell({ agent }: { agent: Agent }) {
                 {agent.successRate.toFixed(1)}%
               </span>
             </div>
+
+            {agent.currentModel && (
+              <div className="flex items-center justify-between text-xs">
+                <span className="text-muted-foreground flex items-center gap-1">
+                  <Zap className="w-3 h-3" />
+                  Model
+                </span>
+                <span className={cn(
+                  "font-medium",
+                  agent.usingFallback ? 'text-amber-500' : 'text-foreground'
+                )}>
+                  {agent.currentModel}
+                </span>
+              </div>
+            )}
+
+            {agent.usingFallback && (
+              <div className="flex items-center gap-1.5 p-2 rounded-md bg-amber-500/10 border border-amber-500/20 mt-2">
+                <AlertTriangle className="w-3 h-3 text-amber-500" />
+                <span className="text-[10px] text-amber-400 font-medium">
+                  Using fallback model
+                </span>
+              </div>
+            )}
             
             {agent.circuitBreakerState !== 'closed' && (
               <div className="flex items-center gap-1.5 p-2 rounded-md bg-red-500/10 border border-red-500/20 mt-2">

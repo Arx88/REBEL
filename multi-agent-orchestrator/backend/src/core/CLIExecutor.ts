@@ -152,7 +152,9 @@ export class CLIExecutor extends EventEmitter {
         fromModel: this.originalModelId,
         toModel: fallbackModel.id,
         reason: 'rate_limit',
-        fallbackAttempt: this.fallbackAttempts
+        fallbackAttempt: this.fallbackAttempts,
+        maxAttempts: this.MAX_FALLBACK_ATTEMPTS,
+        taskId
       });
       
       // Reinitialize with new model
@@ -407,7 +409,7 @@ export class CLIExecutor extends EventEmitter {
     return false;
   }
 
-  async execute(prompt: string, context?: string): Promise<CLIResponse> {
+  async execute(prompt: string, context?: string, taskId?: number): Promise<CLIResponse> {
     // Check circuit breaker
     if (this.circuitBreaker.state === 'open') {
       const timeSinceLastFailure = Date.now() - this.circuitBreaker.lastFailure;
@@ -436,7 +438,7 @@ export class CLIExecutor extends EventEmitter {
       }
     }
 
-    return this.executeWithRetry(prompt, context);
+    return this.executeWithRetry(prompt, context, 0, taskId);
   }
 
   private async executeWithRetry(prompt: string, context?: string, retryCount: number = 0, taskId?: number): Promise<CLIResponse> {

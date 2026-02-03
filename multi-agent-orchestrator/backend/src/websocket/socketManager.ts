@@ -168,6 +168,10 @@ export class SocketManager extends EventEmitter {
     this.broadcastToAll({ type: 'agent_pool_status', payload: { agents } });
   }
 
+  broadcastAgentPoolStatus(data: { total: number; ready: number; busy: number; agents: AgentStatus[] }): void {
+    this.broadcastToAll({ type: 'agent_pool_status', payload: data });
+  }
+
   // Timeline events
   notifyTimelineEvent(event: TimelineEvent): void {
     const taskIdNum = parseInt(event.taskId, 10);

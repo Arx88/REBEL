@@ -87,13 +87,15 @@ export class Orchestrator extends BaseCLIAgent {
     // Store plan in memory for context
     this.memoryManager.set(taskId, 'current_plan', plan, { priority: 'critical' });
 
+    const totalPhases = plan.phases.length;
+
     for (let i = 0; i < plan.phases.length; i++) {
       const phase = plan.phases[i];
       console.log(`[Orchestrator] Fase ${i + 1}/${plan.phases.length}: ${phase.name}`);
       
       this.emit('phase_started', { taskId, phaseIndex: i, phaseName: phase.name });
 
-      const phaseResult = await this.executePhase(taskId, phase, i);
+      const phaseResult = await this.executePhase(taskId, phase, i, totalPhases);
       phaseResults.push(phaseResult);
 
       totalPassed += phaseResult.criticSummary.passed;
@@ -135,10 +137,27 @@ export class Orchestrator extends BaseCLIAgent {
   /**
    * Execute a single phase with parallel execution and verification
    */
-  private async executePhase(taskId: number, phase: Phase, phaseIndex: number): Promise<PhaseResult> {
+  private async executePhase(
+    taskId: number,
+    phase: Phase,
+    phaseIndex: number,
+    totalPhases: number
+  ): Promise<PhaseResult> {
     const startTime = Date.now();
     const subtaskResults = new Map<string, ExecutionResult>();
     let passed = 0, failed = 0, revised = 0;
+    const totalSubtasks = phase.subtasks.length;
+    let completedSubtasks = 0;
+
+    this.emit('phase_progress', {
+      taskId,
+      phaseIndex,
+      phaseName: phase.name,
+      totalPhases,
+      status: 'starting',
+      completedSubtasks,
+      totalSubtasks
+    });
 
     // Generate Delegation Contracts for all subtasks
     const contracts = await this.generateDelegationContracts(taskId, phase, phaseIndex);
@@ -151,6 +170,8 @@ export class Orchestrator extends BaseCLIAgent {
       const parallelTasks = group.map(contract => ({
         id: contract.subtaskId,
         model: contract.assignedModel,
+        description: contract.objective,
+        assignedAgent: contract.assignedModel,
         prompt: this.buildExecutionPrompt(contract),
         context: contract.contextCMN,
         verificationCriteria: {
@@ -164,7 +185,8 @@ export class Orchestrator extends BaseCLIAgent {
       const batchResults = await this.parallelExecutor.executeBatch(
         `phase_${phaseIndex}_batch`, 
         parallelTasks,
-        this.createVerificationHooks(taskId)
+        this.createVerificationHooks(taskId),
+        taskId
       );
 
       // Process results with critic verification
@@ -177,6 +199,23 @@ export class Orchestrator extends BaseCLIAgent {
         );
 
         subtaskResults.set(subtaskId, executionResult);
+        completedSubtasks += 1;
+
+        this.emit('phase_progress', {
+          taskId,
+          phaseIndex,
+          phaseName: phase.name,
+          totalPhases,
+          status: executionResult.success ? 'in_progress' : 'failed',
+          completedSubtasks,
+          totalSubtasks,
+          currentSubtask: {
+            id: contract.subtaskId,
+            description: contract.objective,
+            assignedAgent: contract.assignedModel,
+            model: contract.assignedModel
+          }
+        });
 
         if (executionResult.success) {
           passed++;
@@ -193,6 +232,16 @@ export class Orchestrator extends BaseCLIAgent {
         }, { priority: executionResult.success ? 'medium' : 'high' });
       }
     }
+
+    this.emit('phase_progress', {
+      taskId,
+      phaseIndex,
+      phaseName: phase.name,
+      totalPhases,
+      status: failed === 0 || passed > failed ? 'completed' : 'failed',
+      completedSubtasks,
+      totalSubtasks
+    });
 
     return {
       phaseName: phase.name,
@@ -341,7 +390,9 @@ export class Orchestrator extends BaseCLIAgent {
       const retryResult = await this.agentPool.executeWithAgent(
         contract.assignedModel,
         retryPrompt,
-        contract.contextCMN
+        contract.contextCMN,
+        undefined,
+        taskId
       );
 
       currentResult = retryResult;

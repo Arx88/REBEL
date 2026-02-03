@@ -6,18 +6,17 @@ import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { ScrollArea } from '@/components/ui/scroll-area';
+import { Progress } from '@/components/ui/progress';
 import { 
   Activity, 
   Bot, 
   ListTodo, 
   RefreshCw,
-  Wifi,
   WifiOff,
   Zap,
   ChevronRight,
   Clock,
   CheckCircle2,
-  XCircle,
   Loader2,
   TrendingUp,
   Cpu,
@@ -52,6 +51,8 @@ interface Agent {
   totalExecutions: number;
   failedExecutions: number;
   successRate: number;
+  currentModel?: string;
+  usingFallback?: boolean;
 }
 
 interface TimelineEvent {
@@ -60,6 +61,7 @@ interface TimelineEvent {
   type: 'info' | 'success' | 'warning' | 'error' | 'approval_needed' | 'phase_start';
   message: string;
   details?: any;
+  taskId?: number;
 }
 
 interface PendingApproval {
@@ -73,17 +75,73 @@ export function Dashboard() {
   const [agents, setAgents] = useState<Agent[]>([]);
   const [selectedTaskId, setSelectedTaskId] = useState<number | null>(null);
   const [timeline, setTimeline] = useState<TimelineEvent[]>([]);
+  const [activityFeed, setActivityFeed] = useState<TimelineEvent[]>([]);
   const [pendingApprovals, setPendingApprovals] = useState<PendingApproval[]>([]);
   const [loading, setLoading] = useState(false);
   const [stats, setStats] = useState({ total: 0, ready: 0, busy: 0 });
+  const [taskFocus, setTaskFocus] = useState<{
+    status?: string;
+    currentPhase?: string;
+    currentSubtask?: string;
+    lastEvent?: string;
+    lastEventAt?: string;
+    progress?: number;
+    completedSubtasks?: number;
+    totalSubtasks?: number;
+    phaseStatus?: string;
+  } | null>(null);
 
-  const { isConnected, subscribe } = useWebSocket({
+  const { isConnected, subscribe, subscribeGlobal } = useWebSocket({
     url: WS_URL,
     onConnect: () => {
       if (selectedTaskId) subscribe(selectedTaskId);
     },
     onMessage: (message) => handleWebSocketMessage(message),
   });
+
+  const mapTimelineType = useCallback((eventType: string): TimelineEvent['type'] => {
+    const normalized = eventType.toLowerCase();
+    if (normalized.includes('phase_start')) return 'phase_start';
+    if (normalized.includes('approval')) return 'approval_needed';
+    if (normalized.includes('error') || normalized.includes('failed')) return 'error';
+    if (normalized.includes('warning') || normalized.includes('cancel')) return 'warning';
+    if (
+      normalized.includes('completed') ||
+      normalized.includes('approved') ||
+      normalized.includes('refined') ||
+      normalized.includes('generated') ||
+      normalized.includes('validated') ||
+      normalized.includes('restored')
+    ) {
+      return 'success';
+    }
+    if (normalized.includes('fallback')) return 'warning';
+    return 'info';
+  }, []);
+
+  const appendTimelineEvent = useCallback((event: TimelineEvent) => {
+    setTimeline(prev => [...prev, event].slice(-200));
+  }, []);
+
+  const appendActivityEvent = useCallback((event: TimelineEvent) => {
+    setActivityFeed(prev => [...prev, event].slice(-200));
+  }, []);
+
+  const buildTimelineEvent = useCallback((data: {
+    type: string;
+    message?: string;
+    details?: any;
+    timestamp?: string;
+    taskId?: number;
+    humanReadable?: string;
+  }): TimelineEvent => ({
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    timestamp: data.timestamp || new Date().toISOString(),
+    type: mapTimelineType(data.type),
+    message: data.humanReadable || data.message || data.type,
+    details: data.details,
+    taskId: data.taskId
+  }), [mapTimelineType]);
 
   const handleWebSocketMessage = useCallback((message: any) => {
     switch (message.type) {
@@ -102,36 +160,200 @@ export function Dashboard() {
             ? { ...t, status: message.payload.status }
             : t
         ));
+        if (message.payload.taskId === selectedTaskId) {
+          setTaskFocus(prev => ({
+            ...(prev || {}),
+            status: message.payload.status,
+            lastEvent: `Estado actualizado: ${message.payload.status}`,
+            lastEventAt: message.timestamp || new Date().toISOString()
+          }));
+        }
+        appendActivityEvent(buildTimelineEvent({
+          type: 'task_status_change',
+          message: `Tarea #${message.payload.taskId} → ${message.payload.status}`,
+          timestamp: message.timestamp,
+          taskId: message.payload.taskId
+        }));
         break;
 
-      case 'timeline_update':
+      case 'timeline_event':
+      case 'timeline_update': {
+        const event = buildTimelineEvent({
+          type: message.payload.type || 'info',
+          message: message.payload.message,
+          details: message.payload.details,
+          timestamp: message.timestamp,
+          taskId: Number(message.payload.taskId)
+        });
         if (message.payload.taskId === selectedTaskId) {
-          setTimeline(prev => [...prev, {
-            id: `${Date.now()}`,
-            timestamp: message.timestamp || new Date().toISOString(),
-            ...message.payload
-          }]);
+          appendTimelineEvent(event);
+          setTaskFocus(prev => ({
+            ...(prev || {}),
+            lastEvent: event.message,
+            lastEventAt: event.timestamp
+          }));
         }
+        appendActivityEvent(event);
         break;
+      }
 
       case 'plan_needs_approval':
         setPendingApprovals(prev => [
           ...prev.filter(p => p.taskId !== message.payload.taskId),
           message.payload
         ]);
+        appendActivityEvent(buildTimelineEvent({
+          type: 'approval_needed',
+          message: message.payload.message || `Plan requiere aprobación para tarea #${message.payload.taskId}`,
+          details: message.payload,
+          timestamp: message.timestamp,
+          taskId: message.payload.taskId
+        }));
         break;
 
       case 'approval_received':
         setPendingApprovals(prev => 
           prev.filter(p => p.taskId !== message.payload.taskId)
         );
+        appendActivityEvent(buildTimelineEvent({
+          type: 'approval_received',
+          message: `Aprobación recibida para tarea #${message.payload.taskId}`,
+          details: message.payload,
+          timestamp: message.timestamp,
+          taskId: message.payload.taskId
+        }));
         break;
 
+      case 'task_state':
+        setTasks(prev => {
+          const exists = prev.find(task => task.id === message.payload.id);
+          if (exists) {
+            return prev.map(task => task.id === message.payload.id ? message.payload : task);
+          }
+          return [message.payload, ...prev];
+        });
+        break;
+
+      case 'phase_progress': {
+        const event = buildTimelineEvent({
+          type: message.type,
+          message: message.payload.humanReadable,
+          details: message.payload,
+          timestamp: message.timestamp,
+          taskId: message.payload.taskId
+        });
+        if (message.payload.taskId === selectedTaskId) {
+          appendTimelineEvent(event);
+          setTaskFocus(prev => ({
+            ...(prev || {}),
+            currentPhase: message.payload.phaseName,
+            progress: message.payload.overallProgress,
+            completedSubtasks: message.payload.completedSubtasks,
+            totalSubtasks: message.payload.totalSubtasks,
+            phaseStatus: message.payload.status,
+            lastEvent: event.message,
+            lastEventAt: event.timestamp
+          }));
+        }
+        appendActivityEvent(event);
+        break;
+      }
+
+      case 'subtask_execution': {
+        const event = buildTimelineEvent({
+          type: message.payload.status || message.type,
+          message: message.payload.humanReadable,
+          details: message.payload,
+          timestamp: message.timestamp,
+          taskId: message.payload.taskId
+        });
+        if (message.payload.taskId === selectedTaskId) {
+          appendTimelineEvent(event);
+          setTaskFocus(prev => ({
+            ...(prev || {}),
+            currentSubtask: message.payload.description,
+            lastEvent: event.message,
+            lastEventAt: event.timestamp
+          }));
+        }
+        appendActivityEvent(event);
+        break;
+      }
+
+      case 'model_fallback':
+      case 'model_restored': {
+        const event = buildTimelineEvent({
+          type: message.type,
+          message: message.payload.humanReadable || message.payload.message,
+          details: message.payload,
+          timestamp: message.timestamp,
+          taskId: message.payload.taskId
+        });
+        if (message.payload.taskId === selectedTaskId) {
+          appendTimelineEvent(event);
+        }
+        appendActivityEvent(event);
+        break;
+      }
+
+      case 'task_failed':
+      case 'task_paused':
+      case 'task_resumed':
+      case 'task_cancelled': {
+        const event = buildTimelineEvent({
+          type: message.type,
+          message: message.payload.error || message.payload.message || message.type,
+          details: message.payload,
+          timestamp: message.timestamp,
+          taskId: message.payload.taskId
+        });
+        if (message.payload.taskId === selectedTaskId) {
+          appendTimelineEvent(event);
+        }
+        appendActivityEvent(event);
+        fetchTasks();
+        break;
+      }
+
+      case 'error': {
+        const event = buildTimelineEvent({
+          type: message.type,
+          message: message.payload.error,
+          details: message.payload.details,
+          timestamp: message.timestamp,
+          taskId: message.payload.taskId
+        });
+        if (message.payload.taskId === selectedTaskId) {
+          appendTimelineEvent(event);
+        }
+        appendActivityEvent(event);
+        break;
+      }
+
       case 'task_complete':
+        if (message.payload?.taskId) {
+          const event = buildTimelineEvent({
+            type: 'task_completed',
+            message: `Tarea #${message.payload.taskId} completada`,
+            details: message.payload,
+            timestamp: message.timestamp,
+            taskId: message.payload.taskId
+          });
+          if (message.payload.taskId === selectedTaskId) {
+            appendTimelineEvent(event);
+          }
+          appendActivityEvent(event);
+        }
         fetchTasks();
         break;
     }
-  }, [selectedTaskId]);
+  }, [
+    selectedTaskId,
+    appendTimelineEvent,
+    appendActivityEvent,
+    buildTimelineEvent,
+    fetchTasks
+  ]);
 
   const fetchTasks = useCallback(async () => {
     try {
@@ -175,18 +397,20 @@ export function Dashboard() {
       const res = await fetch(`${API_BASE}/tasks/${taskId}/timeline`);
       const data = await res.json();
       if (data.success) {
-        setTimeline(data.events?.map((e: any, i: number) => ({
-          id: `${i}`,
-          timestamp: e.created_at,
-          type: e.event_type,
-          message: e.message,
-          details: e.details ? JSON.parse(e.details) : null
-        })) || []);
+        setTimeline(data.events?.map((e: any) => (
+          buildTimelineEvent({
+            type: e.event_type,
+            message: e.message,
+            details: e.details ? JSON.parse(e.details) : null,
+            timestamp: e.created_at,
+            taskId
+          })
+        )) || []);
       }
     } catch (e) {
       console.error('Failed to fetch timeline:', e);
     }
-  }, []);
+  }, [buildTimelineEvent]);
 
   const handleCreateTask = async (data: { userInput: string; context?: string; autoApprove: boolean }) => {
     setLoading(true);
@@ -242,15 +466,53 @@ export function Dashboard() {
   }, [fetchTasks, fetchAgentStatus, fetchPendingApprovals]);
 
   useEffect(() => {
+    if (isConnected) {
+      subscribeGlobal();
+    }
+  }, [isConnected, subscribeGlobal]);
+
+  useEffect(() => {
     if (selectedTaskId) {
       subscribe(selectedTaskId);
       fetchTimeline(selectedTaskId);
     }
   }, [selectedTaskId, subscribe, fetchTimeline]);
 
+  useEffect(() => {
+    if (!selectedTaskId) {
+      setTaskFocus(null);
+    }
+  }, [selectedTaskId]);
+
+  useEffect(() => {
+    if (!selectedTaskId) return;
+    const task = tasks.find(t => t.id === selectedTaskId);
+    if (task) {
+      setTaskFocus(prev => ({
+        ...(prev || {}),
+        status: task.status
+      }));
+    }
+  }, [tasks, selectedTaskId]);
+
   const activeTasks = tasks.filter(t => !['completed', 'failed', 'cancelled'].includes(t.status));
   const completedTasks = tasks.filter(t => ['completed', 'failed', 'cancelled'].includes(t.status));
   const successRate = stats.total > 0 ? ((stats.ready / stats.total) * 100).toFixed(0) : '0';
+  const selectedTask = selectedTaskId ? tasks.find(t => t.id === selectedTaskId) : null;
+  const selectedTaskProgress = selectedTask?.stats?.total
+    ? Math.round((selectedTask.stats.completed / selectedTask.stats.total) * 100)
+    : 0;
+  const statusBadgeStyles: Record<string, string> = {
+    completed: 'border-emerald-500/40 text-emerald-400 bg-emerald-500/10',
+    failed: 'border-red-500/40 text-red-400 bg-red-500/10',
+    cancelled: 'border-slate-500/40 text-slate-400 bg-slate-500/10',
+    awaiting_approval: 'border-amber-500/40 text-amber-400 bg-amber-500/10',
+    planning: 'border-blue-500/40 text-blue-400 bg-blue-500/10',
+    refining_plan: 'border-indigo-500/40 text-indigo-400 bg-indigo-500/10',
+    validating_plan: 'border-purple-500/40 text-purple-400 bg-purple-500/10',
+    orchestrating: 'border-cyan-500/40 text-cyan-400 bg-cyan-500/10',
+    synthesizing: 'border-primary/40 text-primary bg-primary/10',
+  };
 
   return (
     <div className="min-h-screen bg-background grid-pattern">
@@ -361,7 +623,12 @@ export function Dashboard() {
                 <p className="text-sm text-muted-foreground">Review and approve to continue execution</p>
               </div>
             </div>
-            <Button variant="outline" size="sm" className="border-amber-500/30 text-amber-500 hover:bg-amber-500/10">
+            <Button
+              variant="outline"
+              size="sm"
+              className="border-amber-500/30 text-amber-500 hover:bg-amber-500/10"
+              onClick={() => setSelectedTaskId(pendingApprovals[0]?.taskId ?? null)}
+            >
               Review Now
               <ChevronRight className="w-4 h-4 ml-1" />
             </Button>
@@ -512,6 +779,103 @@ export function Dashboard() {
               />
             ))}
 
+            <Card className="glass border-border/50">
+              <CardHeader className="pb-4 border-b border-border/50">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <div className="w-8 h-8 rounded-lg bg-primary/10 flex items-center justify-center">
+                      <BarChart3 className="w-4 h-4 text-primary" />
+                    </div>
+                    <div>
+                      <CardTitle className="text-base">Task Focus</CardTitle>
+                      <CardDescription className="text-xs">
+                        {selectedTask ? `Task #${selectedTask.id} live status` : 'Select a task to monitor'}
+                      </CardDescription>
+                    </div>
+                  </div>
+                  {selectedTask && (
+                    <Badge
+                      variant="outline"
+                      className={cn(
+                        "text-[10px] uppercase tracking-wider font-medium",
+                        statusBadgeStyles[selectedTask.status] || 'border-border text-muted-foreground'
+                      )}
+                    >
+                      {selectedTask.status.replace('_', ' ')}
+                    </Badge>
+                  )}
+                </div>
+              </CardHeader>
+              <CardContent className="pt-4">
+                {selectedTask ? (
+                  <div className="space-y-4">
+                    <div className="space-y-1">
+                      <p className="text-xs text-muted-foreground uppercase tracking-wider">Objective</p>
+                      <p className="text-sm text-foreground leading-relaxed">{selectedTask.user_input}</p>
+                    </div>
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
+                      <div className="rounded-lg border border-border/50 bg-muted/20 p-3">
+                        <p className="text-muted-foreground">Current phase</p>
+                        <p className="text-sm font-semibold text-foreground">
+                          {taskFocus?.currentPhase || selectedTask.status.replace('_', ' ')}
+                        </p>
+                      </div>
+                      <div className="rounded-lg border border-border/50 bg-muted/20 p-3">
+                        <p className="text-muted-foreground">Active subtask</p>
+                        <p className="text-sm font-semibold text-foreground line-clamp-2">
+                          {taskFocus?.currentSubtask || 'Waiting for update'}
+                        </p>
+                      </div>
+                      <div className="rounded-lg border border-border/50 bg-muted/20 p-3">
+                        <p className="text-muted-foreground">Phase status</p>
+                        <p className="text-sm font-semibold text-foreground capitalize">
+                          {taskFocus?.phaseStatus || 'pending'}
+                        </p>
+                        {taskFocus?.totalSubtasks ? (
+                          <p className="text-[10px] text-muted-foreground mt-1">
+                            {taskFocus.completedSubtasks ?? 0}/{taskFocus.totalSubtasks} subtasks
+                          </p>
+                        ) : null}
+                      </div>
+                    </div>
+                    <div>
+                      <div className="flex items-center justify-between text-[10px] text-muted-foreground mb-1.5">
+                        <span>Progress</span>
+                        <span className="font-mono">{selectedTaskProgress}%</span>
+                      </div>
+                      <Progress value={selectedTaskProgress} className="h-2" />
+                      {selectedTask?.stats?.total ? (
+                        <p className="text-[10px] text-muted-foreground mt-1.5">
+                          {selectedTask.stats.completed}/{selectedTask.stats.total} subtasks completed
+                        </p>
+                      ) : null}
+                    </div>
+                    <div className="rounded-lg border border-border/50 bg-muted/20 p-3">
+                      <p className="text-[10px] text-muted-foreground uppercase tracking-wider">Latest update</p>
+                      <p className="text-sm text-foreground mt-1">
+                        {taskFocus?.lastEvent || 'Waiting for new events...'}
+                      </p>
+                      <p className="text-[10px] text-muted-foreground mt-1 font-mono">
+                        {taskFocus?.lastEventAt
+                          ? new Date(taskFocus.lastEventAt).toLocaleTimeString('en-US', { hour12: false })
+                          : '—'}
+                      </p>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="flex flex-col items-center justify-center py-8 text-center">
+                    <div className="w-12 h-12 rounded-xl bg-muted/50 flex items-center justify-center mb-3">
+                      <ListTodo className="w-6 h-6 text-muted-foreground/60" />
+                    </div>
+                    <p className="text-sm text-muted-foreground font-medium">No task selected</p>
+                    <p className="text-xs text-muted-foreground/70 mt-1">
+                      Pick a task from the left panel to follow its progress
+                    </p>
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+
             {/* Timeline */}
             {selectedTaskId && (
               <Card className="glass border-border/50">
@@ -536,6 +900,28 @@ export function Dashboard() {
                 </CardContent>
               </Card>
             )}
+
+            <Card className="glass border-border/50">
+              <CardHeader className="pb-4 border-b border-border/50">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <div className="w-8 h-8 rounded-lg bg-primary/10 flex items-center justify-center">
+                      <TrendingUp className="w-4 h-4 text-primary" />
+                    </div>
+                    <div>
+                      <CardTitle className="text-base">Live Activity</CardTitle>
+                      <CardDescription className="text-xs">System-wide updates</CardDescription>
+                    </div>
+                  </div>
+                  <Badge variant="outline" className="font-mono text-xs">
+                    {activityFeed.length} events
+                  </Badge>
+                </div>
+              </CardHeader>
+              <CardContent className="pt-4">
+                <Timeline events={activityFeed} maxHeight="240px" />
+              </CardContent>
+            </Card>
           </div>
         </div>
       </main>

@@ -330,6 +330,25 @@ export class ModelManager {
   }
 
   /**
+   * Request a fallback model due to non-rate-limit failures
+   */
+  requestFallback(
+    modelId: string,
+    reason: 'error' | 'timeout' | 'circuit_breaker',
+    taskId?: number
+  ): ModelDefinition | null {
+    const currentModel = this.models.get(modelId);
+    if (!currentModel) return null;
+
+    const fallbackModel = this.getFallbackModel(currentModel.provider, modelId);
+    if (fallbackModel) {
+      this.recordFallbackEvent(modelId, fallbackModel.id, reason, taskId);
+    }
+
+    return fallbackModel;
+  }
+
+  /**
    * Get the next fallback model in the hierarchy
    */
   private getFallbackModel(provider: 'gemini' | 'qwen', currentModelId: string): ModelDefinition | null {

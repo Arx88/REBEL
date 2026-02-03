@@ -10,6 +10,8 @@ export interface ParallelTask {
   context?: string;
   dependencies?: string[];
   verificationCriteria?: VerificationCriteria;
+  description?: string;
+  assignedAgent?: string;
 }
 
 export interface TaskResult {
@@ -83,17 +85,18 @@ export class ParallelExecutor extends EventEmitter {
   async executeBatch(
     batchId: string, 
     tasks: ParallelTask[],
-    hooks?: VerificationHooks
+    hooks?: VerificationHooks,
+    taskId?: number
   ): Promise<Map<string, TaskResult>> {
     console.log(`[ParallelExecutor] Ejecutando batch ${batchId} con ${tasks.length} tareas`);
     
     const results = new Map<string, TaskResult>();
     const startTime = Date.now();
 
-    this.emit('batch_started', { batchId, taskCount: tasks.length });
+    this.emit('batch_started', { batchId, taskCount: tasks.length, taskId });
 
     // Execute all tasks in parallel
-    const promises = tasks.map(task => this.executeWithVerification(task, hooks));
+    const promises = tasks.map(task => this.executeWithVerification(task, hooks, taskId));
     const taskResults = await Promise.allSettled(promises);
 
     // Process results
@@ -116,7 +119,8 @@ export class ParallelExecutor extends EventEmitter {
       this.emit('task_completed', {
         batchId,
         taskId: task.id,
-        success: results.get(task.id)?.success || false
+        success: results.get(task.id)?.success || false,
+        parentTaskId: taskId
       });
     }
 
@@ -126,7 +130,8 @@ export class ParallelExecutor extends EventEmitter {
     this.emit('batch_completed', { 
       batchId, 
       results: Object.fromEntries(results),
-      executionTime: totalTime
+      executionTime: totalTime,
+      taskId
     });
 
     return results;
@@ -137,7 +142,8 @@ export class ParallelExecutor extends EventEmitter {
    */
   private async executeWithVerification(
     task: ParallelTask,
-    hooks?: VerificationHooks
+    hooks?: VerificationHooks,
+    taskId?: number
   ): Promise<TaskResult> {
     const startTime = Date.now();
     let lastError: string | undefined;
@@ -153,10 +159,22 @@ export class ParallelExecutor extends EventEmitter {
           : task.prompt;
 
         // Execute with agent
+        this.emit('subtask_started', {
+          taskId,
+          subtaskId: task.id,
+          description: task.description,
+          assignedAgent: task.assignedAgent,
+          model: task.model,
+          attempt: retryCount + 1,
+          maxAttempts: this.config.maxRetries + 1
+        });
+
         const result = await this.agentPool.executeWithAgent(
           task.model,
           prompt,
-          task.context
+          task.context,
+          undefined,
+          taskId
         );
 
         if (!result.success) {
@@ -164,10 +182,31 @@ export class ParallelExecutor extends EventEmitter {
           retryCount++;
           
           if (retryCount <= this.config.maxRetries) {
+            this.emit('subtask_retry', {
+              taskId,
+              subtaskId: task.id,
+              description: task.description,
+              assignedAgent: task.assignedAgent,
+              model: task.model,
+              attempt: retryCount + 1,
+              maxAttempts: this.config.maxRetries + 1,
+              error: lastError
+            });
             await this.sleep(this.config.retryDelayMs * retryCount);
             continue;
           }
           
+          this.emit('subtask_completed', {
+            taskId,
+            subtaskId: task.id,
+            description: task.description,
+            assignedAgent: task.assignedAgent,
+            model: task.model,
+            success: false,
+            executionTimeMs: Date.now() - startTime,
+            error: lastError
+          });
+
           return {
             success: false,
             data: result.data,
@@ -192,10 +231,31 @@ export class ParallelExecutor extends EventEmitter {
             retryCount++;
             
             if (retryCount <= this.config.maxRetries) {
+              this.emit('subtask_retry', {
+                taskId,
+                subtaskId: task.id,
+                description: task.description,
+                assignedAgent: task.assignedAgent,
+                model: task.model,
+                attempt: retryCount + 1,
+                maxAttempts: this.config.maxRetries + 1,
+                error: lastError
+              });
               await this.sleep(this.config.retryDelayMs * retryCount);
               continue;
             }
             
+            this.emit('subtask_completed', {
+              taskId,
+              subtaskId: task.id,
+              description: task.description,
+              assignedAgent: task.assignedAgent,
+              model: task.model,
+              success: false,
+              executionTimeMs: Date.now() - startTime,
+              error: lastError
+            });
+
             return {
               success: false,
               data: result.data,
@@ -222,10 +282,31 @@ export class ParallelExecutor extends EventEmitter {
             retryCount++;
             
             if (retryCount <= this.config.maxRetries) {
+              this.emit('subtask_retry', {
+                taskId,
+                subtaskId: task.id,
+                description: task.description,
+                assignedAgent: task.assignedAgent,
+                model: task.model,
+                attempt: retryCount + 1,
+                maxAttempts: this.config.maxRetries + 1,
+                error: lastError
+              });
               await this.sleep(this.config.retryDelayMs * retryCount);
               continue;
             }
             
+            this.emit('subtask_completed', {
+              taskId,
+              subtaskId: task.id,
+              description: task.description,
+              assignedAgent: task.assignedAgent,
+              model: task.model,
+              success: false,
+              executionTimeMs: Date.now() - startTime,
+              error: lastError
+            });
+
             return {
               success: false,
               data: result.data,
@@ -239,7 +320,7 @@ export class ParallelExecutor extends EventEmitter {
         }
 
         // All checks passed
-        return {
+        const taskResult = {
           success: true,
           data: result.data,
           structuralCheck: lastStructuralCheck,
@@ -248,17 +329,51 @@ export class ParallelExecutor extends EventEmitter {
           retryCount
         };
 
+        this.emit('subtask_completed', {
+          taskId,
+          subtaskId: task.id,
+          description: task.description,
+          assignedAgent: task.assignedAgent,
+          model: task.model,
+          success: true,
+          executionTimeMs: taskResult.executionTime,
+          outputPreview: result.data.substring(0, 200)
+        });
+
+        return taskResult;
+
       } catch (error) {
         lastError = error instanceof Error ? error.message : 'Unknown error';
         retryCount++;
         
         if (retryCount <= this.config.maxRetries) {
+          this.emit('subtask_retry', {
+            taskId,
+            subtaskId: task.id,
+            description: task.description,
+            assignedAgent: task.assignedAgent,
+            model: task.model,
+            attempt: retryCount + 1,
+            maxAttempts: this.config.maxRetries + 1,
+            error: lastError
+          });
           await this.sleep(this.config.retryDelayMs * retryCount);
         }
       }
     }
 
     // All retries exhausted
+    this.emit('subtask_completed', {
+      taskId,
+      subtaskId: task.id,
+      description: task.description,
+      assignedAgent: task.assignedAgent,
+      model: task.model,
+      success: false,
+      executionTimeMs: Date.now() - startTime,
+      error: lastError || 'Max retries exceeded'
+    });
+
     return {
       success: false,
       data: '',

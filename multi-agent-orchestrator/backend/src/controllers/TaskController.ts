@@ -9,7 +9,6 @@ import { PlanRefiner } from '../agents/PlanRefiner';
 import { Orchestrator } from '../agents/Orchestrator';
 import { Synthesizer } from '../agents/Synthesizer';
 import { socketManager } from '../websocket/socketManager';
-import { modelManager } from '../core/ModelConfig';
 import { 
   createTask, 
   updateTaskStatus, 
@@ -17,12 +16,11 @@ import {
   getTasks, 
   addTimelineEvent, 
   getTimelineEvents, 
-  getTaskExecutions 
+  getTaskExecutions,
+  getTaskStats
 } from '../database/db';
 import { 
   Plan, 
-  TaskStatus, 
-  ApprovalStatus, 
   PlanApprovalResponse 
 } from '../../shared/types';
 
@@ -67,6 +65,78 @@ export class TaskController {
     this.planRefiner = new PlanRefiner(agentPool, memoryManager, db);
     this.orchestrator = new Orchestrator(agentPool, memoryManager, db, this.parallelExecutor);
     this.synthesizer = new Synthesizer(agentPool, memoryManager, db);
+
+    this.parallelExecutor.on('subtask_started', (data: any) => {
+      if (!data.taskId) return;
+      socketManager.notifySubtaskExecution(data.taskId, {
+        subtaskId: data.subtaskId,
+        description: data.description || data.subtaskId,
+        phase: 'execution',
+        assignedAgent: data.assignedAgent || data.model,
+        model: data.model,
+        status: 'starting',
+        attempt: data.attempt,
+        maxAttempts: data.maxAttempts
+      });
+    });
+
+    this.parallelExecutor.on('subtask_retry', (data: any) => {
+      if (!data.taskId) return;
+      socketManager.notifySubtaskExecution(data.taskId, {
+        subtaskId: data.subtaskId,
+        description: data.description || data.subtaskId,
+        phase: 'execution',
+        assignedAgent: data.assignedAgent || data.model,
+        model: data.model,
+        status: 'retrying',
+        attempt: data.attempt,
+        maxAttempts: data.maxAttempts,
+        error: data.error
+      });
+    });
+
+    this.parallelExecutor.on('subtask_completed', (data: any) => {
+      if (!data.taskId) return;
+      socketManager.notifySubtaskExecution(data.taskId, {
+        subtaskId: data.subtaskId,
+        description: data.description || data.subtaskId,
+        phase: 'execution',
+        assignedAgent: data.assignedAgent || data.model,
+        model: data.model,
+        status: data.success ? 'completed' : 'failed',
+        executionTimeMs: data.executionTimeMs,
+        result: data.outputPreview ? { success: data.success, outputPreview: data.outputPreview } : undefined,
+        error: data.error
+      });
+    });
+
+    this.orchestrator.on('phase_started', ({ taskId, phaseIndex, phaseName }: any) => {
+      this.recordTimeline(
+        taskId,
+        'phase_start',
+        `Fase ${phaseIndex + 1}: ${phaseName}`
+      );
+    });
+
+    this.orchestrator.on('phase_completed', ({ taskId, phaseIndex, phaseName, success }: any) => {
+      this.recordTimeline(
+        taskId,
+        success ? 'phase_completed' : 'phase_failed',
+        `Fase ${phaseIndex + 1}: ${phaseName} ${success ? 'completada' : 'fallida'}`
+      );
+    });
+
+    this.orchestrator.on('phase_progress', (data: any) => {
+      socketManager.notifyPhaseProgress(data.taskId, {
+        phaseIndex: data.phaseIndex,
+        phaseName: data.phaseName,
+        totalPhases: data.totalPhases,
+        status: data.status,
+        completedSubtasks: data.completedSubtasks,
+        totalSubtasks: data.totalSubtasks,
+        currentSubtask: data.currentSubtask
+      });
+    });
   }
 
   // ============================================
@@ -133,7 +203,7 @@ export class TaskController {
       // FASE 3: APPROVAL (Human-in-the-Loop)
       if (autoApprove && validationResult.approved) {
         console.log(`[TaskController] Auto-aproving plan for task ${taskId}`);
-        addTimelineEvent(this.db, taskId, 'auto_approved', 'Plan auto-aprobado');
+        this.recordTimeline(taskId, 'auto_approved', 'Plan auto-aprobado');
         await this.continueAfterApproval(taskId, plan);
       } else {
         // Wait for user approval
@@ -145,9 +215,25 @@ export class TaskController {
       console.error(`[TaskController] Error processing task ${taskId}:`, error);
       
       updateTaskStatus(this.db, taskId, 'failed', { error_message: errorMessage });
-      addTimelineEvent(this.db, taskId, 'error', 'Error en procesamiento', { error: errorMessage });
+      this.recordTimeline(taskId, 'error', 'Error en procesamiento', { error: errorMessage });
       socketManager.notifyError(taskId, errorMessage);
     }
+  }
+
+  private recordTimeline(taskId: number, eventType: string, message: string, details?: any): void {
+    this.recordTimelineEvent(taskId, eventType, message, details);
+  }
+
+  private recordTimelineEvent(taskId: number, eventType: string, message: string, details?: any): void {
+    addTimelineEvent(this.db, taskId, eventType, message, details);
+    socketManager.notifyTimelineEvent({
+      id: `${taskId}-${Date.now()}`,
+      timestamp: new Date().toISOString(),
+      type: eventType,
+      taskId: String(taskId),
+      message,
+      details
+    });
   }
 
   // ============================================
@@ -163,12 +249,12 @@ export class TaskController {
     
     updateTaskStatus(this.db, taskId, 'planning');
     socketManager.notifyTaskStatusChange(taskId, 'planning');
-    addTimelineEvent(this.db, taskId, 'phase_start', 'Iniciando planificación');
+    this.recordTimeline(taskId, 'phase_start', 'Iniciando planificación');
 
     const planningResult = await this.masterPlanner.execute(taskId, userInput, context || '');
 
     if (!planningResult.success || !planningResult.plan) {
-      addTimelineEvent(this.db, taskId, 'error', 'Error generando plan', { 
+      this.recordTimeline(taskId, 'error', 'Error generando plan', { 
         error: planningResult.error || 'Plan no válido' 
       });
       return null;
@@ -180,7 +266,7 @@ export class TaskController {
       VALUES (?, ?, 'pending')
     `).run(taskId, JSON.stringify(planningResult.plan));
 
-    addTimelineEvent(this.db, taskId, 'plan_generated', 'Plan generado exitosamente');
+    this.recordTimeline(taskId, 'plan_generated', 'Plan generado exitosamente');
     socketManager.broadcastToTask(taskId, { 
       type: 'plan_generated', 
       payload: { plan: planningResult.plan } 
@@ -203,7 +289,7 @@ export class TaskController {
     
     updateTaskStatus(this.db, taskId, 'refining_plan' as any);
     socketManager.notifyTaskStatusChange(taskId, 'refining_plan');
-    addTimelineEvent(this.db, taskId, 'phase_start', 'Iniciando refinamiento iterativo del plan');
+    this.recordTimeline(taskId, 'phase_start', 'Iniciando refinamiento iterativo del plan');
 
     try {
       const refinementResult = await this.planRefiner.execute(
@@ -227,7 +313,7 @@ export class TaskController {
           taskId
         );
 
-        addTimelineEvent(this.db, taskId, 'plan_refined', 
+        this.recordTimeline(taskId, 'plan_refined', 
           `Plan refinado: ${refinementResult.improvements.length} mejoras aplicadas. Score: ${refinementResult.originalScore.toFixed(1)} -> ${refinementResult.finalScore.toFixed(1)}`,
           { 
             improvements: refinementResult.improvements,
@@ -255,7 +341,7 @@ export class TaskController {
       }
     } catch (error) {
       console.warn(`[TaskController] Plan refinement failed, continuing with original plan:`, error);
-      addTimelineEvent(this.db, taskId, 'warning', 'Refinamiento falló, usando plan original');
+      this.recordTimeline(taskId, 'warning', 'Refinamiento falló, usando plan original');
     }
 
     return plan; // Return original plan if refinement fails
@@ -293,7 +379,7 @@ export class TaskController {
       taskId
     );
 
-    addTimelineEvent(
+    this.recordTimeline(
       this.db, 
       taskId, 
       validationResult.approved ? 'plan_validated' : 'plan_needs_review',
@@ -335,7 +421,7 @@ export class TaskController {
     });
 
     // Add timeline event
-    addTimelineEvent(
+    this.recordTimeline(
       this.db, 
       taskId, 
       'approval_needed', 
@@ -451,7 +537,7 @@ export class TaskController {
       `).run(feedback, taskId);
     }
 
-    addTimelineEvent(this.db, taskId, 'user_approved', 'Plan aprobado por el usuario', { feedback });
+    this.recordTimeline(taskId, 'user_approved', 'Plan aprobado por el usuario', { feedback });
     
     socketManager.broadcastToTask(taskId, {
       type: 'approval_received',
@@ -478,7 +564,7 @@ export class TaskController {
       UPDATE plans SET validation_status = 'user_rejected' WHERE task_id = ?
     `).run(taskId);
 
-    addTimelineEvent(this.db, taskId, 'user_rejected', 'Plan rechazado por el usuario', { feedback });
+    this.recordTimeline(taskId, 'user_rejected', 'Plan rechazado por el usuario', { feedback });
     
     socketManager.broadcastToTask(taskId, {
       type: 'approval_received',
@@ -499,10 +585,10 @@ export class TaskController {
     pendingApproval.attempts++;
     
     if (pendingApproval.attempts >= 3) {
-      addTimelineEvent(this.db, taskId, 'warning', 'Máximo de modificaciones alcanzado (3 intentos)');
+      this.recordTimeline(taskId, 'warning', 'Máximo de modificaciones alcanzado (3 intentos)');
     }
 
-    addTimelineEvent(this.db, taskId, 'modification_requested', 'Usuario solicitó modificaciones al plan', { 
+    this.recordTimeline(taskId, 'modification_requested', 'Usuario solicitó modificaciones al plan', { 
       feedback,
       modifications,
       attempt: pendingApproval.attempts
@@ -548,7 +634,7 @@ ${pendingApproval.context || ''}
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Error';
       updateTaskStatus(this.db, taskId, 'failed', { error_message: errorMessage });
-      addTimelineEvent(this.db, taskId, 'error', 'Error en ejecución', { error: errorMessage });
+      this.recordTimeline(taskId, 'error', 'Error en ejecución', { error: errorMessage });
       socketManager.notifyError(taskId, errorMessage);
     }
   }
@@ -558,7 +644,7 @@ ${pendingApproval.context || ''}
     
     updateTaskStatus(this.db, taskId, 'orchestrating');
     socketManager.notifyTaskStatusChange(taskId, 'orchestrating');
-    addTimelineEvent(this.db, taskId, 'phase_start', 'Iniciando orquestación de agentes');
+    this.recordTimeline(taskId, 'phase_start', 'Iniciando orquestación de agentes');
 
     const orchestrationResult = await this.orchestrator.execute(taskId, plan);
 
@@ -580,7 +666,7 @@ ${pendingApproval.context || ''}
     
     updateTaskStatus(this.db, taskId, 'synthesizing');
     socketManager.notifyTaskStatusChange(taskId, 'synthesizing');
-    addTimelineEvent(this.db, taskId, 'phase_start', 'Sintetizando resultados');
+    this.recordTimeline(taskId, 'phase_start', 'Sintetizando resultados');
 
     const memoryData = this.memoryManager.getAll(taskId);
     
@@ -593,7 +679,7 @@ ${pendingApproval.context || ''}
 
     // Complete task
     updateTaskStatus(this.db, taskId, 'completed', { final_result: finalReport.completeReport });
-    addTimelineEvent(this.db, taskId, 'task_completed', 'Tarea completada exitosamente');
+    this.recordTimeline(taskId, 'task_completed', 'Tarea completada exitosamente');
     
     socketManager.notifyTaskComplete(taskId, { 
       report: finalReport,
@@ -668,14 +754,19 @@ ${pendingApproval.context || ''}
         limit: parseInt(limit as string),
         offset: parseInt(offset as string)
       });
+
+      const tasksWithStats = tasks.map((task: any) => ({
+        ...task,
+        stats: getTaskStats(this.db, task.id)
+      }));
       
       // Add pending approval count
       const pendingApprovalCount = this.pendingApprovals.size;
       
       res.json({ 
         success: true, 
-        tasks, 
-        count: tasks.length,
+        tasks: tasksWithStats, 
+        count: tasksWithStats.length,
         pendingApprovals: pendingApprovalCount
       });
     } catch (error) {
@@ -740,7 +831,7 @@ ${pendingApproval.context || ''}
       this.pendingApprovals.delete(taskId);
 
       updateTaskStatus(this.db, taskId, 'cancelled');
-      addTimelineEvent(this.db, taskId, 'task_cancelled', 'Cancelada por usuario');
+      this.recordTimeline(taskId, 'task_cancelled', 'Cancelada por usuario');
       socketManager.notifyTaskStatusChange(taskId, 'cancelled');
 
       res.json({ success: true, message: 'Tarea cancelada' });
@@ -766,7 +857,7 @@ ${pendingApproval.context || ''}
       }
 
       updateTaskStatus(this.db, taskId, 'paused');
-      addTimelineEvent(this.db, taskId, 'task_paused', 'Pausada por usuario');
+      this.recordTimeline(taskId, 'task_paused', 'Pausada por usuario');
       socketManager.notifyTaskStatusChange(taskId, 'paused');
 
       res.json({ success: true, message: 'Tarea pausada' });
@@ -802,7 +893,7 @@ ${pendingApproval.context || ''}
         res.json({ success: true, message: 'Tarea reanudada', status: 'orchestrating' });
       }
 
-      addTimelineEvent(this.db, taskId, 'task_resumed', 'Reanudada por usuario');
+      this.recordTimeline(taskId, 'task_resumed', 'Reanudada por usuario');
       socketManager.notifyTaskStatusChange(taskId, task.status);
 
     } catch (error) {

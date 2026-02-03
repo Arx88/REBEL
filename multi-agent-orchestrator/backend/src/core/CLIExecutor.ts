@@ -129,6 +129,52 @@ export class CLIExecutor extends EventEmitter {
     return patterns.some(pattern => pattern.test(response));
   }
 
+  private isTimeoutError(response: string): boolean {
+    return /timeout/i.test(response) || /Response timeout/i.test(response);
+  }
+
+  private isCircuitBreakerError(response: string): boolean {
+    return /circuit breaker/i.test(response);
+  }
+
+  private async handleExecutionFailure(
+    reason: 'error' | 'timeout' | 'circuit_breaker',
+    taskId?: number
+  ): Promise<ModelDefinition | null> {
+    if (this.fallbackAttempts >= this.MAX_FALLBACK_ATTEMPTS) {
+      return null;
+    }
+
+    this.modelManager.recordError(this.currentModelId, reason === 'circuit_breaker', taskId);
+    const fallbackModel = this.modelManager.requestFallback(this.currentModelId, reason, taskId);
+    if (!fallbackModel) {
+      return null;
+    }
+
+    this.fallbackAttempts++;
+    console.log(`[${this.config.agentId}] Falling back to ${fallbackModel.id} (reason: ${reason}, attempt ${this.fallbackAttempts}/${this.MAX_FALLBACK_ATTEMPTS})`);
+
+    this.currentModelId = fallbackModel.id;
+    this.config.command = fallbackModel.command;
+    this.config.args = [...fallbackModel.args];
+
+    this.emit('model_fallback', {
+      agentId: this.config.agentId,
+      fromModel: this.originalModelId,
+      toModel: fallbackModel.id,
+      reason,
+      fallbackAttempt: this.fallbackAttempts,
+      maxAttempts: this.MAX_FALLBACK_ATTEMPTS,
+      taskId
+    });
+
+    await this.destroy();
+    this.initAttempts = 0;
+    await this.initialize();
+
+    return fallbackModel;
+  }
+
   /**
    * Handle rate limit by switching to fallback model
    */
@@ -152,7 +198,9 @@ export class CLIExecutor extends EventEmitter {
         fromModel: this.originalModelId,
         toModel: fallbackModel.id,
         reason: 'rate_limit',
-        fallbackAttempt: this.fallbackAttempts
+        fallbackAttempt: this.fallbackAttempts,
+        maxAttempts: this.MAX_FALLBACK_ATTEMPTS,
+        taskId
       });
       
       // Reinitialize with new model
@@ -327,6 +375,10 @@ export class CLIExecutor extends EventEmitter {
           } else {
             console.log(`[${this.config.agentId}] CLI process exited: code=${code}, signal=${signal}`);
             this.emit('process_exit', { code, signal });
+
+            if (this.isExecuting) {
+              this.finishExecution(false, `CLI process exited (${code ?? 'unknown'} / ${signal ?? 'signal'})`);
+            }
             
             // Try to reconnect if we were ready
             this.attemptReconnect();
@@ -407,7 +459,7 @@ export class CLIExecutor extends EventEmitter {
     return false;
   }
 
-  async execute(prompt: string, context?: string): Promise<CLIResponse> {
+  async execute(prompt: string, context?: string, taskId?: number): Promise<CLIResponse> {
     // Check circuit breaker
     if (this.circuitBreaker.state === 'open') {
       const timeSinceLastFailure = Date.now() - this.circuitBreaker.lastFailure;
@@ -436,7 +488,7 @@ export class CLIExecutor extends EventEmitter {
       }
     }
 
-    return this.executeWithRetry(prompt, context);
+    return this.executeWithRetry(prompt, context, 0, taskId);
   }
 
   private async executeWithRetry(prompt: string, context?: string, retryCount: number = 0, taskId?: number): Promise<CLIResponse> {
@@ -445,8 +497,10 @@ export class CLIExecutor extends EventEmitter {
     try {
       const result = await this.doExecute(prompt, context);
       
+      const errorPayload = result.error || result.data;
+
       // Check for rate limit in response
-      if (result.success && this.isRateLimitError(result.data)) {
+      if (this.isRateLimitError(result.data || '')) {
         console.log(`[${this.config.agentId}] Rate limit detected in response`);
         
         const fallbackModel = await this.handleRateLimit(taskId);
@@ -463,6 +517,23 @@ export class CLIExecutor extends EventEmitter {
           modelUsed: this.currentModelId
         };
       }
+
+      if (!result.success) {
+        const reason = this.isTimeoutError(errorPayload || '') ? 'timeout' : 'error';
+        if (this.isCircuitBreakerError(errorPayload || '')) {
+          const fallbackModel = await this.handleExecutionFailure('circuit_breaker', taskId);
+          if (fallbackModel) {
+            return this.executeWithRetry(prompt, context, retryCount, taskId);
+          }
+        } else {
+          const fallbackModel = await this.handleExecutionFailure(reason, taskId);
+          if (fallbackModel) {
+            return this.executeWithRetry(prompt, context, retryCount, taskId);
+          }
+        }
+
+        throw new Error(errorPayload || 'Execution failed');
+      }
       
       // Success - reset circuit breaker and record stats
       if (result.success) {
@@ -478,10 +549,27 @@ export class CLIExecutor extends EventEmitter {
       return result;
     } catch (error) {
       const errorStr = String(error);
-      
+
       // Check if error indicates rate limit
       if (this.isRateLimitError(errorStr)) {
         const fallbackModel = await this.handleRateLimit(taskId);
+        if (fallbackModel) {
+          return this.executeWithRetry(prompt, context, retryCount, taskId);
+        }
+      }
+
+      if (this.isCircuitBreakerError(errorStr)) {
+        const fallbackModel = await this.handleExecutionFailure('circuit_breaker', taskId);
+        if (fallbackModel) {
+          return this.executeWithRetry(prompt, context, retryCount, taskId);
+        }
+      } else if (this.isTimeoutError(errorStr)) {
+        const fallbackModel = await this.handleExecutionFailure('timeout', taskId);
+        if (fallbackModel) {
+          return this.executeWithRetry(prompt, context, retryCount, taskId);
+        }
+      } else {
+        const fallbackModel = await this.handleExecutionFailure('error', taskId);
         if (fallbackModel) {
           return this.executeWithRetry(prompt, context, retryCount, taskId);
         }

@@ -151,6 +151,8 @@ export class Orchestrator extends BaseCLIAgent {
       const parallelTasks = group.map(contract => ({
         id: contract.subtaskId,
         model: contract.assignedModel,
+        description: contract.objective,
+        assignedAgent: contract.assignedModel,
         prompt: this.buildExecutionPrompt(contract),
         context: contract.contextCMN,
         verificationCriteria: {
@@ -164,7 +166,8 @@ export class Orchestrator extends BaseCLIAgent {
       const batchResults = await this.parallelExecutor.executeBatch(
         `phase_${phaseIndex}_batch`, 
         parallelTasks,
-        this.createVerificationHooks(taskId)
+        this.createVerificationHooks(taskId),
+        taskId
       );
 
       // Process results with critic verification
@@ -341,7 +344,9 @@ export class Orchestrator extends BaseCLIAgent {
       const retryResult = await this.agentPool.executeWithAgent(
         contract.assignedModel,
         retryPrompt,
-        contract.contextCMN
+        contract.contextCMN,
+        undefined,
+        taskId
       );
 
       currentResult = retryResult;

@@ -54,6 +54,14 @@ const statusConfig: Record<string, {
     border: 'border-blue-500/30',
     animate: true,
   },
+  refining_plan: {
+    icon: Sparkles,
+    label: 'Refining',
+    color: 'text-indigo-400',
+    bg: 'bg-indigo-500/10',
+    border: 'border-indigo-500/30',
+    animate: true,
+  },
   validating: {
     icon: Loader2,
     label: 'Validating',

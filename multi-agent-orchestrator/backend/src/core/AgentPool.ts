@@ -1,5 +1,6 @@
-import { CLIExecutor, CLIConfig, CLIResponse } from './CLIExecutor';
+import { CLIExecutor, CLIResponse } from './CLIExecutor';
 import { EventEmitter } from 'events';
+import { socketManager } from '../websocket/socketManager';
 
 export interface PoolConfig {
   geminiCLIPath: string;
@@ -31,6 +32,8 @@ export interface AgentHealthStatus {
   failedExecutions: number;
   successRate: number;
   lastUsed: number;
+  currentModel: string;
+  usingFallback: boolean;
 }
 
 export class AgentPool extends EventEmitter {
@@ -136,6 +139,24 @@ export class AgentPool extends EventEmitter {
     executor.on('reconnect_failed', ({ agentId, error }) => {
       console.error(`[AgentPool] Agent ${agentId} reconnect failed:`, error);
       this.emit('agent_reconnect_failed', { agentId, model, error });
+    });
+
+    executor.on('model_fallback', (data) => {
+      socketManager.notifyModelFallback(data.taskId ?? null, {
+        agentId: data.agentId,
+        fromModel: data.fromModel,
+        toModel: data.toModel,
+        reason: data.reason,
+        fallbackAttempt: data.fallbackAttempt,
+        maxAttempts: data.maxAttempts
+      });
+    });
+
+    executor.on('model_restored', (data) => {
+      socketManager.notifyModelRestored(data.taskId ?? null, {
+        agentId: data.agentId,
+        model: data.model
+      });
     });
 
     try {
@@ -274,13 +295,14 @@ export class AgentPool extends EventEmitter {
     model: 'gemini' | 'qwen', 
     prompt: string, 
     context?: string,
-    timeoutMs?: number
+    timeoutMs?: number,
+    taskId?: number
   ): Promise<CLIResponse> {
     const agent = await this.acquireAgent(model, timeoutMs);
     
     try {
       agent.totalExecutions++;
-      const result = await agent.executor.execute(prompt, context);
+      const result = await agent.executor.execute(prompt, context, taskId);
       
       if (!result.success) {
         agent.failedExecutions++;
@@ -362,7 +384,9 @@ export class AgentPool extends EventEmitter {
         totalExecutions: agent.totalExecutions,
         failedExecutions: agent.failedExecutions,
         successRate,
-        lastUsed: agent.lastUsed
+        lastUsed: agent.lastUsed,
+        currentModel: executorStatus.currentModel.id,
+        usingFallback: executorStatus.currentModel.usingFallback
       };
     });
   }

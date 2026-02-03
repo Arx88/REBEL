@@ -7,6 +7,10 @@ import { Button } from '@/components/ui/button';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Progress } from '@/components/ui/progress';
+import { Input } from '@/components/ui/input';
+import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
+import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet';
+import { Separator } from '@/components/ui/separator';
 import { 
   Activity, 
   Bot, 
@@ -21,7 +25,11 @@ import {
   TrendingUp,
   Cpu,
   BarChart3,
-  Sparkles
+  Sparkles,
+  Filter,
+  Search,
+  AlertCircle,
+  Layers
 } from 'lucide-react';
 
 import { AgentGrid } from './AgentGrid';
@@ -90,6 +98,10 @@ export function Dashboard() {
     totalSubtasks?: number;
     phaseStatus?: string;
   } | null>(null);
+  const [activityFilter, setActivityFilter] = useState<'all' | TimelineEvent['type']>('all');
+  const [timelineFilter, setTimelineFilter] = useState<'all' | TimelineEvent['type']>('all');
+  const [searchValue, setSearchValue] = useState('');
+  const [selectedEvent, setSelectedEvent] = useState<TimelineEvent | null>(null);
 
   const { isConnected, subscribe, subscribeGlobal } = useWebSocket({
     url: WS_URL,
@@ -502,6 +514,19 @@ export function Dashboard() {
   const selectedTaskProgress = selectedTask?.stats?.total
     ? Math.round((selectedTask.stats.completed / selectedTask.stats.total) * 100)
     : 0;
+  const pipelineSteps = [
+    { key: 'planning', label: 'Planning' },
+    { key: 'refining_plan', label: 'Refining' },
+    { key: 'validating_plan', label: 'Validating' },
+    { key: 'awaiting_approval', label: 'Approval' },
+    { key: 'orchestrating', label: 'Execution' },
+    { key: 'synthesizing', label: 'Synthesis' },
+    { key: 'completed', label: 'Done' }
+  ];
+  const pipelineIndex = selectedTask
+    ? Math.max(pipelineSteps.findIndex(step => step.key === selectedTask.status), 0)
+    : 0;
+  const pipelineProgress = selectedTask ? Math.round(((pipelineIndex + 1) / pipelineSteps.length) * 100) : 0;
   const statusBadgeStyles: Record<string, string> = {
     completed: 'border-emerald-500/40 text-emerald-400 bg-emerald-500/10',
     failed: 'border-red-500/40 text-red-400 bg-red-500/10',
@@ -513,6 +538,17 @@ export function Dashboard() {
     orchestrating: 'border-cyan-500/40 text-cyan-400 bg-cyan-500/10',
     synthesizing: 'border-primary/40 text-primary bg-primary/10',
   };
+  const matchesFilter = (event: TimelineEvent, filter: 'all' | TimelineEvent['type']) => {
+    if (filter === 'all') return true;
+    return event.type === filter;
+  };
+  const matchesSearch = (event: TimelineEvent) => {
+    if (!searchValue.trim()) return true;
+    const haystack = `${event.message} ${JSON.stringify(event.details ?? '')}`.toLowerCase();
+    return haystack.includes(searchValue.toLowerCase());
+  };
+  const filteredTimeline = timeline.filter(event => matchesFilter(event, timelineFilter) && matchesSearch(event));
+  const filteredActivity = activityFeed.filter(event => matchesFilter(event, activityFilter) && matchesSearch(event));
 
   return (
     <div className="min-h-screen bg-background grid-pattern">
@@ -766,6 +802,71 @@ export function Dashboard() {
               </CardContent>
             </Card>
 
+            <Card className="glass border-border/50">
+              <CardHeader className="pb-4 border-b border-border/50">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <div className="w-8 h-8 rounded-lg bg-primary/10 flex items-center justify-center">
+                      <Layers className="w-4 h-4 text-primary" />
+                    </div>
+                    <div>
+                      <CardTitle className="text-base">Execution Pipeline</CardTitle>
+                      <CardDescription className="text-xs">Phase-level status for the selected task</CardDescription>
+                    </div>
+                  </div>
+                  {selectedTask && (
+                    <Badge variant="outline" className="font-mono text-xs">
+                      {pipelineProgress}% complete
+                    </Badge>
+                  )}
+                </div>
+              </CardHeader>
+              <CardContent className="pt-4 space-y-4">
+                {selectedTask ? (
+                  <>
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                      {pipelineSteps.map((step, index) => {
+                        const isActive = index === pipelineIndex;
+                        const isDone = index < pipelineIndex;
+                        return (
+                          <div
+                            key={step.key}
+                            className={cn(
+                              'rounded-lg border px-3 py-2 text-xs',
+                              isActive && 'border-primary/60 bg-primary/10 text-primary',
+                              isDone && !isActive && 'border-emerald-500/40 bg-emerald-500/10 text-emerald-400',
+                              !isDone && !isActive && 'border-border/50 bg-muted/10 text-muted-foreground'
+                            )}
+                          >
+                            <p className="font-semibold">{step.label}</p>
+                            <p className="text-[10px] mt-1 uppercase tracking-wider">
+                              {isActive ? 'Active' : isDone ? 'Done' : 'Pending'}
+                            </p>
+                          </div>
+                        );
+                      })}
+                    </div>
+                    <div>
+                      <Progress value={pipelineProgress} className="h-2" />
+                      <p className="text-[10px] text-muted-foreground mt-2">
+                        Current status: {selectedTask.status.replace('_', ' ')}
+                      </p>
+                    </div>
+                  </>
+                ) : (
+                  <div className="flex flex-col items-center justify-center py-6 text-center">
+                    <div className="w-12 h-12 rounded-xl bg-muted/50 flex items-center justify-center mb-3">
+                      <AlertCircle className="w-6 h-6 text-muted-foreground/60" />
+                    </div>
+                    <p className="text-sm text-muted-foreground font-medium">Select a task to view the pipeline</p>
+                    <p className="text-xs text-muted-foreground/70 mt-1">
+                      The pipeline will highlight each phase as it runs
+                    </p>
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+
             {/* Pending Approvals */}
             {pendingApprovals.map(approval => (
               <PlanApproval
@@ -880,7 +981,8 @@ export function Dashboard() {
             {selectedTaskId && (
               <Card className="glass border-border/50">
                 <CardHeader className="pb-4 border-b border-border/50">
-                  <div className="flex items-center justify-between">
+                  <div className="flex flex-col gap-3">
+                    <div className="flex items-center justify-between">
                     <div className="flex items-center gap-2">
                       <div className="w-8 h-8 rounded-lg bg-primary/10 flex items-center justify-center">
                         <BarChart3 className="w-4 h-4 text-primary" />
@@ -894,16 +996,44 @@ export function Dashboard() {
                       {timeline.length} events
                     </Badge>
                   </div>
+                    <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+                      <div className="relative w-full md:max-w-xs">
+                        <Search className="absolute left-2 top-2.5 h-4 w-4 text-muted-foreground" />
+                        <Input
+                          value={searchValue}
+                          onChange={(event) => setSearchValue(event.target.value)}
+                          placeholder="Search events..."
+                          className="pl-8"
+                        />
+                      </div>
+                      <ToggleGroup
+                        type="single"
+                        value={timelineFilter}
+                        onValueChange={(value) => setTimelineFilter((value || 'all') as typeof timelineFilter)}
+                        className="justify-start"
+                      >
+                        <ToggleGroupItem value="all" aria-label="All">
+                          <Filter className="w-3 h-3 mr-1" />
+                          All
+                        </ToggleGroupItem>
+                        <ToggleGroupItem value="info">Info</ToggleGroupItem>
+                        <ToggleGroupItem value="success">Success</ToggleGroupItem>
+                        <ToggleGroupItem value="warning">Warnings</ToggleGroupItem>
+                        <ToggleGroupItem value="error">Errors</ToggleGroupItem>
+                      </ToggleGroup>
+                    </div>
+                  </div>
                 </CardHeader>
                 <CardContent className="pt-4">
-                  <Timeline events={timeline} maxHeight="320px" />
+                  <Timeline events={filteredTimeline} maxHeight="320px" onEventClick={setSelectedEvent} />
                 </CardContent>
               </Card>
             )}
 
             <Card className="glass border-border/50">
               <CardHeader className="pb-4 border-b border-border/50">
-                <div className="flex items-center justify-between">
+                <div className="flex flex-col gap-3">
+                  <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2">
                     <div className="w-8 h-8 rounded-lg bg-primary/10 flex items-center justify-center">
                       <TrendingUp className="w-4 h-4 text-primary" />
@@ -917,14 +1047,77 @@ export function Dashboard() {
                     {activityFeed.length} events
                   </Badge>
                 </div>
+                  <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+                    <div className="relative w-full md:max-w-xs">
+                      <Search className="absolute left-2 top-2.5 h-4 w-4 text-muted-foreground" />
+                      <Input
+                        value={searchValue}
+                        onChange={(event) => setSearchValue(event.target.value)}
+                        placeholder="Search activity..."
+                        className="pl-8"
+                      />
+                    </div>
+                    <ToggleGroup
+                      type="single"
+                      value={activityFilter}
+                      onValueChange={(value) => setActivityFilter((value || 'all') as typeof activityFilter)}
+                      className="justify-start"
+                    >
+                      <ToggleGroupItem value="all" aria-label="All">
+                        <Filter className="w-3 h-3 mr-1" />
+                        All
+                      </ToggleGroupItem>
+                      <ToggleGroupItem value="info">Info</ToggleGroupItem>
+                      <ToggleGroupItem value="success">Success</ToggleGroupItem>
+                      <ToggleGroupItem value="warning">Warnings</ToggleGroupItem>
+                      <ToggleGroupItem value="error">Errors</ToggleGroupItem>
+                    </ToggleGroup>
+                  </div>
+                </div>
               </CardHeader>
               <CardContent className="pt-4">
-                <Timeline events={activityFeed} maxHeight="240px" />
+                <Timeline events={filteredActivity} maxHeight="240px" onEventClick={setSelectedEvent} />
               </CardContent>
             </Card>
           </div>
         </div>
       </main>
+
+      <Sheet open={Boolean(selectedEvent)} onOpenChange={(open) => !open && setSelectedEvent(null)}>
+        <SheetContent side="right" className="w-full sm:max-w-lg">
+          <SheetHeader>
+            <SheetTitle>Event details</SheetTitle>
+            <SheetDescription>
+              {selectedEvent?.taskId ? `Task #${selectedEvent.taskId}` : 'System event'}
+            </SheetDescription>
+          </SheetHeader>
+          <Separator className="my-4" />
+          {selectedEvent ? (
+            <div className="space-y-4 text-sm">
+              <div>
+                <p className="text-xs uppercase tracking-wider text-muted-foreground">Type</p>
+                <p className="font-semibold text-foreground">{selectedEvent.type}</p>
+              </div>
+              <div>
+                <p className="text-xs uppercase tracking-wider text-muted-foreground">Message</p>
+                <p className="text-foreground">{selectedEvent.message}</p>
+              </div>
+              <div>
+                <p className="text-xs uppercase tracking-wider text-muted-foreground">Timestamp</p>
+                <p className="font-mono text-foreground">
+                  {new Date(selectedEvent.timestamp).toLocaleString('en-US')}
+                </p>
+              </div>
+              <div>
+                <p className="text-xs uppercase tracking-wider text-muted-foreground">Payload</p>
+                <pre className="whitespace-pre-wrap break-words rounded-lg border border-border/50 bg-muted/30 p-3 text-xs">
+                  {JSON.stringify(selectedEvent.details ?? {}, null, 2)}
+                </pre>
+              </div>
+            </div>
+          ) : null}
+        </SheetContent>
+      </Sheet>
     </div>
   );
 }

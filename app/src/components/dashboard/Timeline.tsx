@@ -24,6 +24,7 @@ interface TimelineProps {
   events: TimelineEvent[];
   className?: string;
   maxHeight?: string;
+  onEventClick?: (event: TimelineEvent) => void;
 }
 
 const eventConfig = {
@@ -77,7 +78,7 @@ const eventConfig = {
   },
 };
 
-export function Timeline({ events, className, maxHeight = '400px' }: TimelineProps) {
+export function Timeline({ events, className, maxHeight = '400px', onEventClick }: TimelineProps) {
   if (events.length === 0) {
     return (
       <div className={cn(
@@ -102,6 +103,7 @@ export function Timeline({ events, className, maxHeight = '400px' }: TimelinePro
             event={event} 
             isLast={index === events.length - 1}
             isFirst={index === 0}
+            onClick={onEventClick}
           />
         ))}
       </div>
@@ -112,11 +114,13 @@ export function Timeline({ events, className, maxHeight = '400px' }: TimelinePro
 function TimelineItem({ 
   event, 
   isLast,
-  isFirst 
+  isFirst,
+  onClick
 }: { 
   event: TimelineEvent; 
   isLast: boolean;
   isFirst: boolean;
+  onClick?: (event: TimelineEvent) => void;
 }) {
   const config = eventConfig[event.type] || eventConfig.info;
   const Icon = config.icon;
@@ -132,6 +136,10 @@ function TimelineItem({
   };
 
   const isPhase = event.type === 'phase_start';
+
+  const handleClick = () => {
+    onClick?.(event);
+  };
 
   return (
     <div className={cn(
@@ -162,7 +170,22 @@ function TimelineItem({
           </div>
         </div>
       ) : (
-        <div className="flex gap-3 py-2">
+        <div
+          className={cn(
+            'flex gap-3 py-2',
+            onClick && 'cursor-pointer'
+          )}
+          onClick={handleClick}
+          role={onClick ? 'button' : undefined}
+          tabIndex={onClick ? 0 : undefined}
+          onKeyDown={(event) => {
+            if (!onClick) return;
+            if (event.key === 'Enter' || event.key === ' ') {
+              event.preventDefault();
+              handleClick();
+            }
+          }}
+        >
           {/* Timeline line and dot */}
           <div className="flex flex-col items-center w-6 shrink-0">
             <div className={cn(
